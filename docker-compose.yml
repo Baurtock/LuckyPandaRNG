@@ -1,0 +1,31 @@
+version: "3.8"
+
+services:
+  traefik:
+    image: traefik:v3.0
+    command:
+      - --api.dashboard=true
+      - --entrypoints.web.address=:80
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+    ports:
+      - "80:80"
+      - "8081:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - traefik-net
+
+  rng-api:
+    build: .
+    deploy:
+      replicas: 10
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.rng.rule=Host(`localhost`) && PathPrefix(`/`)"
+      - "traefik.http.services.rng.loadbalancer.server.port=8080"
+    networks:
+      - traefik-net
+
+networks:
+  traefik-net:
