@@ -1,0 +1,118 @@
+name: Build and Deploy to Kubernetes
+
+on:
+  push:
+    branches: [ master ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Necesario para obtener todo el historial de tags
+
+    - name: Bump version and create tag
+      id: version
+      uses: anothrNick/github-tag-action@1.70.0
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        WITH_V: true
+        MAJOR_STRING_TOKEN: "major:"
+        MINOR_STRING_TOKEN: "feature:,feat:"
+        PATCH_STRING_TOKEN: "fix:,bugfix:"
+        DEFAULT_BUMP: patch
+
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GH_TOKEN }}
+
+    - name: Extract metadata (tags, labels) for Docker
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=raw,value=latest
+          type=raw,value=${{ steps.version.outputs.new_tag }}
+          type=raw,value=${{ steps.version.outputs.tag }}
+          type=sha,prefix=sha-
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+
+    - name: Set up kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'latest'
+
+    - name: Configure kubectl
+      run: |
+        echo "${{ secrets.KUBE_CONFIG_EU_WEST_2 }}" | base64 --decode > $HOME/.kube/config
+        chmod 600 $HOME/.kube/config
+
+    - name: Create Docker registry secret for Kubernetes
+      run: |
+        # Crear las credenciales de Docker en formato base64
+        DOCKER_CONFIG=$(echo -n '{"auths":{"ghcr.io":{"username":"${{ github.actor }}","password":"${{ secrets.GH_TOKEN }}","auth":"'$(echo -n '${{ github.actor }}:${{ secrets.GH_TOKEN }}' | base64 -w 0)'"}}}' | base64 -w 0)
+        
+        # Reemplazar el placeholder en el secret
+        sed -i "s|DOCKER_CONFIG_PLACEHOLDER|$DOCKER_CONFIG|g" k8s/registry-secret.yaml
+
+    - name: Deploy to Kubernetes
+      run: |
+        # Reemplazar la imagen en el deployment con la nueva versión
+        sed -i "s|IMAGE_PLACEHOLDER|${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.new_tag }}|g" k8s/deployment.yaml
+        
+        # Aplicar los manifiestos (el secret primero)
+        kubectl apply -f k8s/registry-secret.yaml
+        kubectl apply -f k8s/configmap.yaml
+        kubectl apply -f k8s/deployment.yaml
+        kubectl apply -f k8s/service.yaml
+        kubectl apply -f k8s/hpa.yaml
+
+    - name: Verify deployment
+      run: |
+        kubectl rollout status deployment/luckypanda-rng -n default
+        kubectl get pods -l app=luckypanda-rng -n default
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ steps.version.outputs.new_tag }}
+        name: Release ${{ steps.version.outputs.new_tag }}
+        body: |
+          ## Release ${{ steps.version.outputs.new_tag }}
+          
+          **Commit:** ${{ github.event.head_commit.message }}
+          
+          ### Changes
+          - Deployed version ${{ steps.version.outputs.new_tag }} to Kubernetes
+          - Docker image: `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.new_tag }}`
+          - 10 replicas running in production
+          
+          ### Docker Tags
+          - `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest`
+          - `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.new_tag }}`
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
