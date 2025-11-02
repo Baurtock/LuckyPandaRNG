@@ -1,0 +1,156 @@
+name: Build and Deploy to Kubernetes
+
+on:
+  push:
+    branches: [ master ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Necesario para obtener todo el historial de tags
+
+    - name: Bump version and create tag
+      id: version
+      uses: anothrNick/github-tag-action@1.70.0
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        WITH_V: true
+        MAJOR_STRING_TOKEN: "major:"
+        MINOR_STRING_TOKEN: "feature:,feat:"
+        PATCH_STRING_TOKEN: "fix:,bugfix:"
+        DEFAULT_BUMP: patch
+
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata (tags, labels) for Docker
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=raw,value=latest
+          type=raw,value=${{ steps.version.outputs.new_tag }}
+          type=raw,value=${{ steps.version.outputs.tag }}
+          type=sha,prefix=sha-
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+
+    - name: Set up kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'latest'
+
+    - name: Configure SSH and kubectl via bastion
+      run: |
+        # Configurar SSH
+        mkdir -p $HOME/.ssh
+        echo "${{ secrets.BASTION_SSH_PRIVATE_KEY_EU_WEST_2 }}" > $HOME/.ssh/bastion_key
+        chmod 600 $HOME/.ssh/bastion_key
+        
+        # Configurar SSH config para usar bastion
+        cat > $HOME/.ssh/config << EOF
+        Host k8s-master
+          HostName ${{ secrets.KUBE_HOST_EU_WEST_2 }}
+          User ${{ secrets.BASTION_SSH_USER_EU_WEST_2 }}
+          Port ${{ secrets.BASTION_SSH_PORT_EU_WEST_2 }}
+          ProxyJump bastion
+          IdentityFile $HOME/.ssh/bastion_key
+          StrictHostKeyChecking no
+        
+        Host bastion
+          HostName ${{ secrets.BASTION_SSH_HOST_EU_WEST_2 }}
+          User ${{ secrets.BASTION_SSH_USER_EU_WEST_2 }}
+          Port ${{ secrets.BASTION_SSH_PORT_EU_WEST_2 }}
+          IdentityFile $HOME/.ssh/bastion_key
+          StrictHostKeyChecking no
+        EOF
+
+    - name: Setup kubectl config from secret
+      run: |
+        mkdir -p $HOME/.kube
+        echo "${{ secrets.KUBE_CONFIG_EU_WEST_2 }}" | base64 --decode > $HOME/.kube/config
+        chmod 600 $HOME/.kube/config
+
+    - name: Create Docker registry secret for Kubernetes
+      run: |
+        # Crear las credenciales de Docker en formato base64
+        DOCKER_CONFIG=$(echo -n '{"auths":{"ghcr.io":{"username":"${{ github.actor }}","password":"${{ secrets.GITHUB_TOKEN }}","auth":"'$(echo -n '${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}' | base64 -w 0)'"}}}' | base64 -w 0)
+        
+        # Reemplazar el placeholder en el secret
+        sed -i "s|DOCKER_CONFIG_PLACEHOLDER|$DOCKER_CONFIG|g" k8s/registry-secret.yaml
+
+    - name: Deploy to Kubernetes via SSH Tunnel
+      run: |
+        # Reemplazar la imagen en el deployment con la nueva versión
+        sed -i "s|IMAGE_PLACEHOLDER|${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.new_tag }}|g" k8s/deployment.yaml
+        
+        # Crear túnel SSH para conectar a K8s API a través del bastion
+        ssh -f -N -L 6443:${{ secrets.KUBE_HOST_EU_WEST_2 }}:${{ secrets.KUBE_PORT_EU_WEST_2 }} bastion
+        
+        # Esperar un momento para que el túnel se establezca
+        sleep 5
+        
+        # Modificar kubeconfig para usar el túnel local
+        sed -i 's|https://54.36.179.233:6443|https://localhost:6443|g' $HOME/.kube/config
+        
+        # Aplicar los manifiestos a través del túnel
+        kubectl apply -f k8s/registry-secret.yaml
+        kubectl apply -f k8s/configmap.yaml
+        kubectl apply -f k8s/deployment.yaml
+        kubectl apply -f k8s/service.yaml
+        kubectl apply -f k8s/hpa.yaml
+        
+        # Verificar rollout
+        kubectl rollout status deployment/luckypanda-rng -n default --timeout=300s
+
+    - name: Verify deployment
+      run: |
+        kubectl get deployment luckypanda-rng -n default
+        kubectl get pods -l app=luckypanda-rng -n default
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ steps.version.outputs.new_tag }}
+        name: Release ${{ steps.version.outputs.new_tag }}
+        body: |
+          ## Release ${{ steps.version.outputs.new_tag }}
+          
+          **Commit:** ${{ github.event.head_commit.message }}
+          
+          ### Changes
+          - Deployed version ${{ steps.version.outputs.new_tag }} to Kubernetes
+          - Docker image: `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.new_tag }}`
+          - 10 replicas running in production
+          
+          ### Docker Tags
+          - `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest`
+          - `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.new_tag }}`
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
