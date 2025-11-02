@@ -4,6 +4,41 @@
 
 LuckyPanda is an API designed to provide random number generation (RNG) services. It is intended for applications that require high-quality randomness, such as games, simulations, or statistical sampling. The project also includes a suite of tools to analyze and test the quality of the RNG.
 
+## Automatic Semantic Versioning
+
+This project uses an automated versioning system based on commit message formatting:
+
+### Commit Prefixes and Versioning
+
+- **`fix:`** → Increments **PATCH** version (v1.0.0 → v1.0.1)
+- **`feature:`** or **`feat:`** → Increments **MINOR** version (v1.0.0 → v1.1.0)  
+- **`major:`** → Increments **MAJOR** version (v1.0.0 → v2.0.0)
+- **Any other prefix** → Increments **PATCH** version by default
+
+### Commit Examples
+
+```bash
+git commit -m "fix: correct parameter validation bug"
+
+git commit -m "feature: add new statistics endpoint"
+git commit -m "feat: implement redis cache"
+
+git commit -m "major: change API response format"
+```
+
+### Generated Docker Tags
+
+For each release, these tags are automatically generated:
+
+- `ghcr.io/your-username/luckypanda-rng:latest`
+- `ghcr.io/your-username/luckypanda-rng:1.2.3` (semantic version)
+- `ghcr.io/your-username/luckypanda-rng:v1.2.3` (with v prefix)
+- `ghcr.io/your-username/luckypanda-rng:sha-abc1234` (commit SHA)
+
+### Deployment
+
+The system automatically deploys 10 replicas to Kubernetes when pushing to the `master` branch.
+
 ## How to run the API
 
 1. **Using Docker Compose**  
